@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, onUnmounted } from 'vue'
-import type { FactoryData } from '@/types'
+import type { FactoryData, Anomaly } from '@/types'
 
 export const useFactoryStore = defineStore('factory', () => {
   const data = ref<FactoryData | null>(null)
@@ -25,5 +25,16 @@ export const useFactoryStore = defineStore('factory', () => {
     connected.value = false
   }
 
-  return { data, connected, connect, disconnect }
+  // 保存处置结果后本地同步, 保证返回列表时处置说明/状态立即一致
+  // (后续 WS 推送以服务端为准, 内容相同不会产生跳变)
+  function patchAnomaly(updated: Anomaly) {
+    if (!data.value) return
+    const list = data.value.anomalies
+    const idx = list.findIndex((a) => a.id === updated.id)
+    if (idx >= 0) {
+      list[idx] = { ...list[idx], ...updated }
+    }
+  }
+
+  return { data, connected, connect, disconnect, patchAnomaly }
 })

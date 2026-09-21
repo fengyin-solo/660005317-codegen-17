@@ -1,6 +1,8 @@
 import asyncio, math, random, time, json, threading
 from collections import defaultdict, deque
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from itertools import count
+from typing import Optional
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
@@ -12,6 +14,34 @@ DEVICE_TYPES = ["CNC", "RobotArm", "Conveyor", "AGV", "InjectionMolding", "QCSta
 STATUSES = ["RUNNING", "IDLE", "FAULT", "OFFLINE"]
 ACTIVE_CLIENTS: list[WebSocket] = []
 SIMULATOR_RUNNING = True
+
+# ---------------------------------------------------------------------------
+# 账号与告警处置权限
+# ---------------------------------------------------------------------------
+# can_handle 取值:
+#   "any"      -> 管理员: 可指派处置人, 可处置任意告警
+#   "assigned" -> 处置工程师: 仅可处置指派给自己的告警
+#   "none"     -> 只读访客: 只能查看
+# 角色若不在该配置中(或缺 can_handle 键), 视为"权限配置缺失", 不允许保存
+ROLE_PERMISSIONS = {
+    "admin":    {"label": "管理员",     "can_handle": "any"},
+    "engineer": {"label": "处置工程师", "can_handle": "assigned"},
+    "viewer":   {"label": "只读访客",   "can_handle": "none"},
+}
+
+USERS = {
+    "admin": {"id": "admin", "name": "管理员",   "role": "admin"},
+    "zhang": {"id": "zhang", "name": "张伟",     "role": "engineer"},
+    "li":    {"id": "li",    "name": "李娜",     "role": "engineer"},
+    "wang":  {"id": "wang",  "name": "王强",     "role": "viewer"},
+    # auditor 角色未在 ROLE_PERMISSIONS 中配置, 用于演示"权限配置缺失"分支
+    "zhao":  {"id": "zhao",  "name": "赵敏",     "role": "auditor"},
+}
+
+ALERT_STATUSES = ["PENDING", "PROCESSING", "RESOLVED"]
+ANOMALY_LOCK = threading.Lock()
+_anomaly_id_seq = count(1)
+MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 class DeviceState:
     def __init__(self, did: int, dtype: str, x: float, y: float, z: float):
@@ -41,7 +71,35 @@ devices = {i: DeviceState(i, random.choice(DEVICE_TYPES),
                           random.uniform(-5, 5), 0.5, random.uniform(-5, 5)) for i in range(1, 13)}
 
 production_log = []
-anomaly_log = []
+anomaly_log = []  # 告警主记录, 每条带稳定 id 及处置信息(处置人/状态/说明)
+
+
+def make_anomaly_entry(triggers, device_type: str, timestamp: float,
+                       assignee: Optional[str] = None,
+                       status: str = "PENDING", note: str = ""):
+    """构造一条带责任归属与处置信息的告警记录。"""
+    return {
+        "id": next(_anomaly_id_seq),
+        "timestamp": timestamp,
+        "triggers": triggers,
+        "device_type": device_type,
+        # 责任归属与处置信息
+        "assignee": assignee,
+        "assignee_name": USERS.get(assignee, {}).get("name") if assignee else None,
+        "status": status,
+        "note": note,
+        "updated_by": None,
+        "updated_at": None,
+    }
+
+
+def serialize_anomaly(a: dict):
+    """返回给前端的告警视图, 实时补齐处置人姓名。"""
+    assignee = a.get("assignee")
+    out = dict(a)
+    out["assignee_name"] = USERS.get(assignee, {}).get("name") if assignee else None
+    return out
+
 
 class AnomalyRules:
     def __init__(self):
@@ -69,7 +127,8 @@ class AnomalyRules:
                 triggers.append({"device_id": dev.id, "rule": "温度趋势上升", "value": round(np.mean(vals[-4:]), 2), "threshold": ">3°C/周期"})
 
         if triggers:
-            anomaly_log.append({"timestamp": time.time(), "triggers": triggers, "device_type": dev.type})
+            with ANOMALY_LOCK:
+                anomaly_log.append(make_anomaly_entry(triggers, dev.type, time.time()))
         return triggers
 
 rules_engine = AnomalyRules()
@@ -107,7 +166,7 @@ def simulate():
             payload = {
                 "devices": [d.to_dict() for d in devices.values()],
                 "production": sum(d.production_count for d in devices.values()),
-                "anomalies": anomaly_log[-5:] if anomaly_log else [],
+                "anomalies": [serialize_anomaly(a) for a in anomaly_log[-5:]] if anomaly_log else [],
                 "oee": calculate_oee()
             }
             msg = json.dumps(payload)
@@ -117,8 +176,9 @@ def simulate():
         dead = []
         for ws in ACTIVE_CLIENTS:
             try:
-                asyncio.run_coroutine_threadsafe(ws.send_text(msg), asyncio.get_event_loop())
-            except:
+                if MAIN_LOOP is not None:
+                    asyncio.run_coroutine_threadsafe(ws.send_text(msg), MAIN_LOOP)
+            except Exception:
                 dead.append(ws)
         for ws in dead:
             if ws in ACTIVE_CLIENTS:
@@ -149,15 +209,167 @@ class OEEAnalysis(BaseModel):
     quality: float
 
 
+class AnomalyHandleRequest(BaseModel):
+    note: Optional[str] = None
+    status: Optional[str] = None
+    assignee: Optional[str] = None  # 仅管理员可修改(指派处置人)
+
+
+def current_user(x_user_id: Optional[str] = Header(default=None)):
+    """从请求头 X-User-Id 解析当前登录账号。"""
+    if not x_user_id or not x_user_id.strip():
+        raise HTTPException(status_code=401, detail={"error": "未识别到登录账号", "reasons": ["请求缺少 X-User-Id 头, 无法确定当前账号"]})
+    uid = x_user_id.strip()
+    user = USERS.get(uid)
+    if not user:
+        raise HTTPException(status_code=401, detail={"error": "账号不存在", "reasons": [f"账号 '{uid}' 不存在"]})
+    return user
+
+
+def find_anomaly(anomaly_id: int):
+    for a in anomaly_log:
+        if a["id"] == anomaly_id:
+            return a
+    return None
+
+
+def recent_anomalies(limit: int):
+    with ANOMALY_LOCK:
+        return [serialize_anomaly(a) for a in anomaly_log[-limit:]]
+
+
 @app.on_event("startup")
 async def startup():
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
+    # 预置几条带责任归属的演示告警, 便于直接看到处置状态(不影响模拟器持续产生新告警)
+    demo = [
+        ([{"device_id": 3, "rule": "高温告警", "value": 51.2, "threshold": 48}],
+         "InjectionMolding", "zhang", "PROCESSING", "已安排停机检查冷却水路, 预计 14:00 完成。"),
+        ([{"device_id": 7, "rule": "振动超标", "value": 2.4, "threshold": 2.0}],
+         "RobotArm", "li", "PENDING", ""),
+        ([{"device_id": 1, "rule": "压力异常", "value": 1.6, "threshold": 1.5}],
+         "CNC", "zhang", "RESOLVED", "更换液压阀后压力恢复正常, 复测合格。"),
+    ]
+    base = time.time() - 30
+    for idx, (triggers, dtype, assignee, status, note) in enumerate(demo):
+        a = make_anomaly_entry(triggers, dtype, base + idx * 10,
+                               assignee=assignee, status=status, note=note)
+        a["updated_by"] = assignee if status != "PENDING" else None
+        a["updated_at"] = base + idx * 10 + 5
+        anomaly_log.append(a)
+
     t = threading.Thread(target=simulate, daemon=True)
     t.start()
 
 
+@app.get("/api/auth/users")
+def list_users(user: dict = Depends(current_user)):
+    """返回可切换的账号列表及其权限配置(用于前端账号切换)。"""
+    return {"users": list(USERS.values()), "role_permissions": ROLE_PERMISSIONS,
+            "current": user["id"]}
+
+
+@app.get("/api/auth/me")
+def get_me(user: dict = Depends(current_user)):
+    perm = ROLE_PERMISSIONS.get(user["role"])
+    return {"user": user, "permission": perm}
+
+
 @app.get("/api/devices")
 def get_devices():
-    return {"devices": [d.to_dict() for d in devices.values()], "anomalies": anomaly_log[-10:]}
+    return {"devices": [d.to_dict() for d in devices.values()], "anomalies": recent_anomalies(10)}
+
+
+@app.get("/api/anomalies")
+def list_anomalies(limit: int = 20):
+    """告警列表(含处置人/状态/说明), 任何登录账号均可只读查看。"""
+    return {"anomalies": recent_anomalies(max(1, min(limit, 100)))}
+
+
+@app.put("/api/anomalies/{anomaly_id}/handle")
+def handle_anomaly(anomaly_id: int, req: AnomalyHandleRequest, user: dict = Depends(current_user)):
+    """
+    保存告警处置结果(处置人指派 / 处置状态 / 处置说明)。
+
+    权限规则:
+      - 管理员(can_handle=any):      可处置任意告警, 可指派/变更处置人
+      - 处置工程师(can_handle=assigned): 仅处置指派给自己的告警, 不得改处置人
+      - 只读访客(can_handle=none):   一律拒绝, 仅可查看
+      - 角色未配置权限: 拒绝保存并指出"权限配置缺失"
+    校验规则:
+      - 处置人必须存在且为有效账号
+      - 状态必须在允许范围内
+      - 处置人为空时不允许保存, 返回全部不合格项
+    """
+    uid = user["id"]
+    role = user["role"]
+    perm = ROLE_PERMISSIONS.get(role)
+
+    # 1) 权限配置缺失: 不允许保存
+    if not perm or "can_handle" not in perm:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "权限配置缺失",
+                    "reasons": [f"账号 '{user['name']}' 的角色 '{role}' 未配置告警处置权限(can_handle 缺失), 请联系管理员补充角色权限配置后再保存"]})
+
+    can_handle = perm["can_handle"]
+
+    # 2) 只读账号 / 无处置权限: 越权请求直接拒绝并说明原因
+    if can_handle == "none":
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "无权修改告警处置信息",
+                    "reasons": [f"账号 '{user['name']}' 的角色为'{perm.get('label', role)}', 只有只读权限, 只能查看告警, 不能修改处置说明与状态"]})
+
+    with ANOMALY_LOCK:
+        anomaly = find_anomaly(anomaly_id)
+        if anomaly is None:
+            raise HTTPException(status_code=404,
+                                detail={"error": "告警不存在", "reasons": [f"未找到 id={anomaly_id} 的告警"]})
+
+        is_admin = can_handle == "any"
+        assignee_changed = req.assignee is not None and req.assignee != anomaly.get("assignee")
+
+        # 3) 非管理员不得指派/变更处置人
+        if assignee_changed and not is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "无权指派处置人",
+                        "reasons": [f"账号 '{user['name']}' 不是管理员, 不能指派或变更处置人(仅管理员可操作); 该告警当前处置人为 '{anomaly.get('assignee_name') or '未指派'}'"]})
+
+        # 4) 非管理员只能处置指派给自己的告警
+        if not is_admin and anomaly.get("assignee") != uid:
+            owner_name = anomaly.get("assignee_name") or "尚未指派"
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "只能处置本人负责的告警",
+                        "reasons": [f"该告警的处置人是 '{owner_name}', 当前账号 '{user['name']}' 不是处置人也不是管理员, 仅可只读查看"]})
+
+        # 5) 字段校验: 汇总所有不合格项, 一次性返回
+        invalid = []
+        new_assignee = req.assignee if req.assignee is not None else anomaly.get("assignee")
+        if not new_assignee or not str(new_assignee).strip():
+            invalid.append("处置人为空: 每条告警必须有明确的处置人, 请先指派处置人后再保存")
+        elif new_assignee not in USERS:
+            invalid.append(f"处置人账号 '{new_assignee}' 不存在, 请选择有效账号")
+
+        new_status = req.status if req.status is not None else anomaly.get("status")
+        if req.status is not None and new_status not in ALERT_STATUSES:
+            invalid.append(f"处置状态 '{req.status}' 不合法, 允许值为 {ALERT_STATUSES}")
+
+        new_note = req.note if req.note is not None else anomaly.get("note", "")
+
+        if invalid:
+            raise HTTPException(status_code=400, detail={"error": "存在不合格项, 未允许保存", "reasons": invalid})
+
+        anomaly["assignee"] = new_assignee
+        anomaly["status"] = new_status
+        anomaly["note"] = new_note
+        anomaly["updated_by"] = uid
+        anomaly["updated_at"] = time.time()
+
+    return {"ok": True, "anomaly": serialize_anomaly(anomaly)}
 
 
 @app.get("/api/oee")

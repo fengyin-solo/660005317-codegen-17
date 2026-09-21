@@ -32,8 +32,13 @@ import OEEChart from './components/OEEChart.vue'
 import TrendPanel from './components/TrendPanel.vue'
 import FaultPie from './components/FaultPie.vue'
 import { useFactoryStore } from './store/factory'
+import { useAuthStore } from './store/auth'
 const store = useFactoryStore()
-onMounted(() => store.connect())
+const auth = useAuthStore()
+onMounted(() => {
+  store.connect()
+  auth.loadUsers()
+})
 onUnmounted(() => store.disconnect())
 </script>
 

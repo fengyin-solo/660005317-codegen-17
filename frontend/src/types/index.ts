@@ -5,9 +5,28 @@ export interface Device {
   uptime: number; quality_rate: number
 }
 
+export type AlertStatus = 'PENDING' | 'PROCESSING' | 'RESOLVED'
+
 export interface Anomaly {
+  id?: number
   timestamp: number; triggers: { device_id: number; rule: string; value: number; threshold: string }[]
   device_type: string
+  // 责任归属与处置信息
+  assignee?: string | null
+  assignee_name?: string | null
+  status?: AlertStatus
+  note?: string
+  updated_by?: string | null
+  updated_at?: number | null
+}
+
+export interface User {
+  id: string; name: string; role: string
+}
+
+export interface RolePermission {
+  label: string
+  can_handle: 'any' | 'assigned' | 'none'
 }
 
 export interface OEEItem {
