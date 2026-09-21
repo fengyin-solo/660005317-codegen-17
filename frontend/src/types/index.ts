@@ -6,8 +6,23 @@ export interface Device {
 }
 
 export interface Anomaly {
-  timestamp: number; triggers: { device_id: number; rule: string; value: number; threshold: string }[]
+  id?: number
+  timestamp: number; triggers: { device_id: number; rule: string; value: number; threshold: string | number }[]
   device_type: string
+  // 责任归属与处置
+  assignee?: string | null
+  note?: string
+  status?: 'PENDING' | 'IN_PROGRESS' | 'RESOLVED' | string
+  updated_by?: string | null
+  updated_at?: number | null
+}
+
+export interface CurrentUser {
+  username: string
+  display_name: string
+  role: string
+  permissions: string[]
+  configured: boolean
 }
 
 export interface OEEItem {
